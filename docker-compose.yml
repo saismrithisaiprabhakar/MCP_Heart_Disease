@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  heart-server:
+    container_name: heart-server
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: heart-server:chromadb-slim    # ✅ Updated tag
+    ports:
+      - "8000:8000"
+
+    # ✅ Keep your environment files secure and simple
+    env_file:
+      - keys.env
+
+    # ✅ Mount only what’s needed
+    volumes:
+      - ./keys.env:/app/keys.env:ro
+      - ./data_summaries_chroma:/app/data_summaries_chroma
+      - ./pdf_database_docs:/app/pdf_database_docs
+
+    environment:
+      PYTHONUNBUFFERED: 1
+
+    restart: unless-stopped
+    tty: true

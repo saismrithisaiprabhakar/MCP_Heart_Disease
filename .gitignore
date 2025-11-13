@@ -1,0 +1,27 @@
+# -------- ENV / SECRETS --------
+*.env
+*.txt
+encrypted_groq_key.txt
+encrypted_key.py
+groq_api_local.env
+keys.env
+
+# -------- VECTOR DATABASES --------
+data_summaries_chroma/
+pdf_database_docs/
+
+# -------- PYTHON CACHE --------
+__pycache__/
+*.pyc
+
+# -------- LOGS --------
+history.txt
+*.log
+
+# -------- DOCKER --------
+*.server
+*.local
+
+# -------- SYSTEM FILES --------
+.DS_Store
+Thumbs.db
