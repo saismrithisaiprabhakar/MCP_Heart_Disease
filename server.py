@@ -1,48 +1,119 @@
 # ===========================
-# server.py — Async + Dynamic Context Ranking + Custom Evaluators
+# server.py — Full RAG + MCP + PII Guardrails + Evaluation
 # ===========================
-
-import nltk
-nltk.download("punkt", quiet=True)
-nltk.download("wordnet", quiet=True)
-nltk.download("stopwords", quiet=True)
-nltk.download("omw-1.4", quiet=True)
 
 from fastmcp import FastMCP
 import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv, find_dotenv
 from groq import Groq
+from cryptography.fernet import Fernet
 import os
 import re
 import json
 import asyncio
 import traceback
-import time
-import contextlib  # <-- needed for nullcontext
 
-# ================== LANGFUSE (v3.x API) ==================
-from langfuse import get_client
+# ================== PRESIDIO — Full PII Detection ==================
+# ================== PRESIDIO (Full PII Detection — Version Compatible) ==================
+from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
 
-try:
-    langfuse = get_client()  # reads LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL
-    print("[Langfuse] Initialized successfully (v3 API).")
-except Exception as e:
-    langfuse = None
-    print(f"[Langfuse] Initialization failed: {e}")
+PRESIDIO_THRESHOLD = float(os.getenv("PRESIDIO_THRESHOLD", 0.50))
 
-# ================== FLAGS & GLOBALS ==================
+# PII categories we want to detect
+_PII_TARGETS = [
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "PERSON",
+    "US_SSN",
+    "LOCATION",
+    "ADDRESS",
+]
+
+def _init_presidio():
+    try:
+        print("[Presidio] Loading en_core_web_lg via NlpEngineProvider…")
+
+        nlp_config = {
+            "nlp_engine_name": "spacy",
+            "models": [
+                {"lang_code": "en", "model_name": "en_core_web_lg"}
+            ]
+        }
+
+        provider = NlpEngineProvider(nlp_configuration=nlp_config)
+        nlp_engine = provider.create_engine()
+
+        registry = RecognizerRegistry()
+
+        # Load all recognizers your version supports
+        registry.load_predefined_recognizers()
+
+        analyzer = AnalyzerEngine(
+            nlp_engine=nlp_engine,
+            registry=registry
+        )
+        anonymizer = AnonymizerEngine()
+
+        print("[Presidio] SUCCESS: All built-in recognizers loaded.")
+        return analyzer, anonymizer, True
+
+    except Exception as e:
+        print("[Presidio INIT ERROR]:", e)
+        return None, None, False
+
+analyzer, anonymizer, PRESIDIO_READY = _init_presidio()
+
+
+def detect_pii(text: str):
+    if not text or not PRESIDIO_READY:
+        return []
+    try:
+        results = analyzer.analyze(
+            text=text,
+            language="en",
+            entities=_PII_TARGETS
+        )
+        return sorted(set(r.entity_type for r in results))
+    except Exception as e:
+        print("[PII DETECTION ERROR]", e)
+        return []
+
+
+def redact_pii(text: str) -> str:
+    if not text or not PRESIDIO_READY:
+        return text
+    try:
+        results = analyzer.analyze(
+            text=text,
+            language="en",
+            entities=_PII_TARGETS
+        )
+
+        if not results:
+            return text
+
+        operators = {
+            r.entity_type: OperatorConfig("replace", {"new_value": "[REDACTED]"})
+            for r in results
+        }
+
+        return anonymizer.anonymize(
+            text=text,
+            analyzer_results=results,
+            operators=operators
+        ).text
+
+    except Exception as e:
+        print("[PII REDACTION ERROR]", e)
+        return text
+# ================== GLOBAL FLAGS ==================
+PII_POLICY = os.getenv("PII_POLICY", "redact").lower()
 EVAL_ENABLED = True
 SIM_READY = False
-sim_model = None
-
-# Guardrail config
-PII_POLICY = os.getenv("PII_POLICY", "block").lower()   # "block" or "redact"
-EVAL_THRESHOLDS = {
-    "faithfulness": float(os.getenv("THRESH_FAITH", 0.70)),
-    "fairness":     float(os.getenv("THRESH_FAIR",  0.70)),
-    "relevance":    float(os.getenv("THRESH_REL",   0.70)),
-}
 
 # ================== PATHS ==================
 RAG_DB_PATH = "./data_summaries_chroma"
@@ -50,7 +121,6 @@ RAG_COLLECTION_NAME = "chunk_summaries"
 PDF_DB_PATH = "./pdf_database_docs"
 PDF_COLLECTION_NAME = "pdf_context_collection"
 
-# ================== MODEL SETTINGS ==================
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 app = FastMCP("RAG + MCP Combined Server")
@@ -58,402 +128,279 @@ app = FastMCP("RAG + MCP Combined Server")
 # ================== LOAD VECTOR STORES ==================
 def load_vector_stores():
     rag_client = chromadb.PersistentClient(
-        path=RAG_DB_PATH, settings=Settings(anonymized_telemetry=False)
+        path=RAG_DB_PATH,
+        settings=Settings(anonymized_telemetry=False)
     )
+
     rag_collection = rag_client.get_or_create_collection(
         RAG_COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
     )
+
     pdf_client = chromadb.PersistentClient(
-        path=PDF_DB_PATH, settings=Settings(anonymized_telemetry=False)
+        path=PDF_DB_PATH,
+        settings=Settings(anonymized_telemetry=False)
     )
     pdf_collection = pdf_client.get_collection(PDF_COLLECTION_NAME)
+
     return rag_collection, pdf_collection
 
 rag_collection, pdf_collection = load_vector_stores()
 
-# ================== LOAD ENV KEYS ==================
-from cryptography.fernet import Fernet
-
+# ================== LOAD KEYS ==================
 dotenv_path = find_dotenv("keys.env", usecwd=True)
 load_dotenv(dotenv_path)
-print(dotenv_path)
 
 fernet_key = os.getenv("FERNET_KEY")
 encrypted_key = os.getenv("ENCRYPTED_GROQ_API_KEY")
 
 if fernet_key and encrypted_key:
     try:
-        groq_api_key = Fernet(fernet_key.encode()).decrypt(encrypted_key.encode()).decode()
+        groq_api_key = Fernet(fernet_key.encode()).decrypt(
+            encrypted_key.encode()
+        ).decode()
         os.environ["GROQ_API_KEY"] = groq_api_key
-        print("Encrypted GROQ key decrypted successfully.")
-    except Exception as e:
-        print(f"Failed to decrypt GROQ_API_KEY: {e}")
-else:
-    print("Using plain GROQ_API_KEY from .env (not encrypted).")
+        print("Encrypted GROQ key decrypted.")
+    except:
+        pass
 
-groq_api_key = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=groq_api_key)
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ================== SENTENCE SIMILARITY ==================
 try:
     from sentence_transformers import SentenceTransformer, util
     sim_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     SIM_READY = True
-except Exception as e:
-    print("[WARN] SentenceTransformer unavailable:", e)
+    print("[SIM] Loaded sentence-transformers.")
+except:
+    print("[SIM WARNING] Not available.")
     SIM_READY = False
 
-# ================== SANITIZER PLACEHOLDER ==================
-def sanitize_input(text: str) -> str:
-    return text
-
-# ================== PII DETECTION / REDACTION (Lightweight) ==================
-# NOTE: This is intentionally lightweight. For production, consider a stronger NER/PII detector.
-_PII_PATTERNS = {
-    "email":  re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-    "phone":  re.compile(r"\b(?:\+?\d{1,2}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b"),
-    "ssn":    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    "name":   re.compile(r"\b([A-Z][a-z]+ [A-Z][a-z]+)\b"),  # naive full-name pattern
-    # Add more as needed (MRN, DOB formats, addresses, etc.)
-}
-
-def detect_pii(text: str) -> list[str]:
-    if not text:
-        return []
-    hits = []
-    for k, pat in _PII_PATTERNS.items():
-        if pat.search(text):
-            hits.append(k)
-    return sorted(set(hits))
-
-def redact_pii(text: str) -> str:
-    if not text:
-        return text
-    redacted = text
-    for k, pat in _PII_PATTERNS.items():
-        redacted = pat.sub("[REDACTED]", redacted)
-    return redacted
-
-# ================== TEXT NORMALIZER ==================
-def _normalize_for_eval(text: str) -> str:
+# ================== NORMALIZE ==================
+def _normalize(text):
     if not text:
         return ""
-    text = text.replace("###", " ").replace("---", " ")
-    text = (
-        text.replace("\u2019", "'")
-        .replace("\u2018", "'")
-        .replace("\u201c", '"')
-        .replace("\u201d", '"')
-        .replace("\u2013", "-")
-        .replace("\u2014", "-")
-    )
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
-# ================== CUSTOM SCORING HELPERS ==================
-def _groq_text(prompt: str) -> str:
-    try:
-        resp = groq_client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=64,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print("[EVAL ERROR] Groq call failed:", e)
-        return "0.0"
-
-async def _soft_llm_score(prompt: str) -> float:
-    text = await asyncio.to_thread(_groq_text, prompt)
-    m = re.findall(r"\d*\.?\d+", text)
-    try:
-        score = float(m[-1]) if m else 0.0
-        return max(0.0, min(1.0, score))
-    except:
-        return 0.0
-
-# ================== SCORING PROMPTS ==================
+# ================== EVALUATION PROMPTS ==================
 def build_faithfulness_prompt(context, response):
     return f"""
-You are an impartial evaluator for medical question answering.
-Rate how faithfully the response follows the provided context — i.e., whether it stays factually consistent without adding unrelated or incorrect details.
+Evaluate FAITHFULNESS.
 
-Scoring (continuous 0.0–1.0):
-- 0.90–1.00 → Fully supported; no contradictions or new claims.
-- 0.70–0.89 → Mostly supported; small omissions or rewordings.
-- 0.40–0.69 → Partially supported; mix of supported and inferred info.
-- 0.10–0.39 → Weakly supported or speculative.
-- 0.00–0.09 → Contradicts or invents facts.
+Definition:
+How accurately does the response reflect ONLY the context?
+
+Scores:
+1.0–0.90 = Fully faithful.
+0.89–0.70 = Mostly faithful.
+0.69–0.40 = Some unsupported claims.
+0.39–0.10 = Largely unsupported.
+0.09–0.00 = Contradicts/makes up facts.
 
 Context:
 {context}
 
 Response:
 {response}
+
+Only output a number.
+""".strip()
+
+def build_relevance_prompt(context, response):
+    return f"""
+Evaluate RELEVANCE.
+
+Definition:
+How well does the answer address the question and use the context?
+
+Scores:
+1.0–0.90 = Highly relevant.
+0.89–0.70 = Mostly relevant.
+0.69–0.40 = Somewhat relevant.
+0.39–0.10 = Weak relevance.
+0.09–0.00 = Not relevant.
+
+Context:
+{context}
+
+Response:
+{response}
+
+Only output a number.
 """.strip()
 
 def build_fairness_prompt(context, response):
     return f"""
-You are an evaluator of fairness and neutrality for medical explanations.
-Judge whether the response is unbiased, balanced, and avoids unfair generalizations.
+Evaluate FAIRNESS.
 
-Scoring (continuous 0.0–1.0):
-- 0.90–1.00 → Completely neutral and balanced.
-- 0.70–0.89 → Mostly fair; minor imbalance or assertive tone.
-- 0.40–0.69 → Somewhat biased or one-sided.
-- 0.10–0.39 → Clearly biased, alarmist, or exaggerated.
-- 0.00–0.09 → Strongly biased or discriminatory.
+Definition:
+Neutral tone, no assumptions, no bias, no fear-inducing wording.
+
+Scores:
+1.0–0.90 = Completely fair.
+0.89–0.70 = Mostly fair.
+0.69–0.40 = Some bias.
+0.39–0.10 = Strong bias.
+0.09–0.00 = Harmful or discriminatory.
 
 Context:
 {context}
 
 Response:
 {response}
+
+Only output a number.
 """.strip()
 
-# ================== MAIN EVALUATOR ==================
-async def evaluate_response_async(question: str, context: str, answer: str) -> dict:
-    results = {
-        "faithfulness": None,
-        "relevance": None,
-        "fairness": None,
-        "semantic_similarity": None,
-        "summary": None,
-        "evaluator": "Groq Soft Evaluator",
+# ================== GROQ EVALUATORS ==================
+def _groq_eval(prompt):
+    try:
+        resp = groq_client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=32
+        )
+        return resp.choices[0].message.content.strip()
+    except:
+        return "0.0"
+
+async def _soft_score(prompt):
+    text = await asyncio.to_thread(_groq_eval, prompt)
+    nums = re.findall(r"\d*\.?\d+", text)
+    try:
+        return max(0.0, min(1.0, float(nums[-1])))
+    except:
+        return 0.0
+
+# ================== MAIN EVALUATION ==================
+async def evaluate_response_async(question, context, answer):
+    context = _normalize(context)
+
+    faith = await _soft_score(build_faithfulness_prompt(context, answer))
+    relev = await _soft_score(build_relevance_prompt(context, answer))
+    fair  = await _soft_score(build_fairness_prompt(context, answer))
+
+    sim = 0.0
+    if SIM_READY:
+        try:
+            emb1 = sim_model.encode(answer, convert_to_tensor=True)
+            emb2 = sim_model.encode(context, convert_to_tensor=True)
+            sim = float(util.cos_sim(emb1, emb2).item()) * 100
+        except:
+            sim = 0.0
+
+    return {
+        "faithfulness": round(faith, 2),
+        "relevance": round(relev, 2),
+        "fairness": round(fair, 2),
+        "semantic_similarity": round(sim, 1)
     }
 
-    clean_context = _normalize_for_eval(context or "")
-    faith_score = await _soft_llm_score(build_faithfulness_prompt(clean_context, answer))
-    fair_score = await _soft_llm_score(build_fairness_prompt(clean_context, answer))
-    results["faithfulness"] = round(faith_score, 2)
-    results["fairness"] = round(fair_score, 2)
-
-    if SIM_READY and context and answer:
-        try:
-            emb_answer = sim_model.encode(answer, convert_to_tensor=True)
-            emb_context = sim_model.encode(context, convert_to_tensor=True)
-            sim_val = float(util.cos_sim(emb_answer, emb_context).item())
-            results["semantic_similarity"] = round(sim_val * 100, 1)
-        except Exception as e:
-            print("[EVAL WARNING] Semantic-similarity failed:", e)
-
-    try:
-        from llama_index.core.evaluation.context_relevancy import (
-            ContextRelevancyEvaluator as RelevanceEvaluator,
-        )
-        from llama_index.llms.groq import Groq as LlamaGroq
-        llama_eval_llm = LlamaGroq(model=MODEL, api_key=os.getenv("GROQ_API_KEY"))
-        relevance_eval = RelevanceEvaluator(llm=llama_eval_llm)
-        rel_obj = await asyncio.to_thread(
-            relevance_eval.evaluate,
-            query=question,
-            contexts=[clean_context],
-            response=answer,
-        )
-        results["relevance"] = round(float(rel_obj.score), 2)
-    except Exception as e:
-        print("[EVAL WARNING] Relevance evaluator failed:", e)
-        results["relevance"] = 0.0
-
-    results["summary"] = (
-        f"Faithfulness: {results['faithfulness']}, "
-        f"Relevance: {results['relevance']}, "
-        f"Fairness: {results['fairness']}, "
-        f"Semantic similarity: {results.get('semantic_similarity', 0.0)}"
-    )
-    for key in ["faithfulness", "relevance", "fairness", "semantic_similarity"]:
-        if results[key] is None:
-            results[key] = 0.0
-
-    return results
-
-# ================== MAIN TOOL ==================
+# ================== MAIN MCP TOOL ==================
 @app.tool()
-async def ask_with_combined_context(question: str) -> dict:
-    """Ask across RAG & PDF vector stores, re-rank context, generate & evaluate."""
+async def ask_with_combined_context(question: str):
     try:
-        if not question.strip():
-            return {"error": "Question cannot be empty."}
-
         print(f"\n[REQUEST] {question}")
 
-        # ---------- PII Guardrail: detect + enforce policy ----------
+        # ---------- 1. PII SANITIZATION ----------
         pii_hits = detect_pii(question)
-        if pii_hits:
-            print(f"[GUARDRAIL] PII detected: {pii_hits} (policy={PII_POLICY})")
-            if langfuse:
-                try:
-                    # If a span exists later, this metadata attaches to the active trace;
-                    # otherwise it still records at client-level trace.
-                    langfuse.update_trace(metadata={"pii_detected": pii_hits, "pii_policy": PII_POLICY})
-                except Exception as e:
-                    print(f"[Langfuse] update_trace (PII) failed: {e}")
+        print("DEBUG PII:", detect_pii(question))
+        print("DEBUG REDACTED:", redact_pii(question))
+        if PII_POLICY == "block" and pii_hits:
+            return {
+                "answer": "⚠️ Sensitive information detected. Please remove personal identifiers."
+            }
 
-            if PII_POLICY == "block":
-                return {
-                    "answer": "⚠️ Personal identifiers detected. Please remove names, emails, phone numbers, or IDs and try again.",
-                    "evaluation": {"faithfulness": 0.0, "fairness": 0.0, "relevance": 0.0, "semantic_similarity": 0.0}
-                }
-            # else redact
-            question_sanitized = redact_pii(question)
-        else:
-            question_sanitized = question
+        question_sanitized = redact_pii(question) if pii_hits else question
+        print("[SANITIZED QUESTION]", question_sanitized)
 
-        # ---------- Root span using Langfuse v3 ----------
-        if langfuse:
-            span_ctx = langfuse.start_as_current_span(
-                name="ask_with_combined_context",
-                input={"question": question_sanitized},
-            )
-        else:
-            span_ctx = None
-
-        with (span_ctx or contextlib.nullcontext()):
-            if langfuse:
-                try:
-                    langfuse.update_trace(
-                        name="ask_with_combined_context",
-                        metadata={
-                            "source": "FastMCP-Server",
-                            "model": MODEL,
-                            "context_type": "combined",
-                            "pii_policy_active": PII_POLICY if pii_hits else "none",
-                        },
-                    )
-                except Exception as e:
-                    print(f"[Langfuse] update_trace failed: {e}")
-
-            # 1) Query vector stores
-            start = time.time()
-
-            async def query_collection(collection, query_texts, n_results):
-                return await asyncio.to_thread(
-                    collection.query,
-                    query_texts=query_texts,
-                    n_results=n_results,
-                    include=["documents", "distances"],
-                )
-
-            df_results, pdf_results = await asyncio.gather(
-                query_collection(rag_collection, [question_sanitized], 12),
-                query_collection(pdf_collection, [question_sanitized], 12),
+        # ---------- 2. RETRIEVAL ----------
+        async def query(collection, q, n):
+            return await asyncio.to_thread(
+                collection.query,
+                query_texts=[q],
+                n_results=n,
+                include=["documents", "distances"]
             )
 
-            df_docs = [doc for sub in df_results.get("documents", []) for doc in sub]
-            pdf_docs = [doc for sub in pdf_results.get("documents", []) for doc in sub]
-            df_dist = df_results.get("distances", [[]])[0]
-            pdf_dist = pdf_results.get("distances", [[]])[0]
+        df_res, pdf_res = await asyncio.gather(
+            query(rag_collection, question_sanitized, 10),
+            query(pdf_collection, question_sanitized, 10)
+        )
 
-            def _pair(docs, dist, src):
-                out = []
-                for i, d in enumerate(docs):
-                    base = 1 - dist[i] if i < len(dist) and dist[i] is not None else 0.0
-                    out.append({"text": d, "source": src, "base": base})
-                return out
+        df_docs = [d for sub in df_res.get("documents", []) for d in sub]
+        df_dist = df_res.get("distances", [[]])[0]
 
-            pairs = _pair(df_docs, df_dist, "RAG") + _pair(pdf_docs, pdf_dist, "PDF")
-            print(f"[INFO] Retrieved {len(pairs)} documents (SIM_READY={SIM_READY})")
+        pdf_docs = [d for sub in pdf_res.get("documents", []) for d in sub]
+        pdf_dist = pdf_res.get("distances", [[]])[0]
 
-            if SIM_READY:
-                q_emb = sim_model.encode(question_sanitized, convert_to_tensor=True)
-                for p in pairs:
-                    emb_doc = sim_model.encode(p["text"], convert_to_tensor=True)
-                    sim = float(util.cos_sim(q_emb, emb_doc).item())
-                    p["score"] = (p["base"] + (sim + 1) / 2) / 2
-            else:
-                for p in pairs:
-                    p["score"] = p["base"]
+        def pack(docs, dist):
+            items = []
+            for i, d in enumerate(docs):
+                score = 1 - dist[i] if i < len(dist) else 0
+                items.append({"text": d, "score": score})
+            return items
 
-            pairs.sort(key=lambda x: x["score"], reverse=True)
+        pairs = pack(df_docs, df_dist) + pack(pdf_docs, pdf_dist)
 
-            # 2) Combine context
-            TOP_K = 10
-            top_texts = [p["text"] for p in pairs[:TOP_K]]
-            combined_context = _normalize_for_eval("\n\n".join(top_texts))
+        if SIM_READY:
+            q_emb = sim_model.encode(question_sanitized, convert_to_tensor=True)
+            for p in pairs:
+                emb = sim_model.encode(p["text"], convert_to_tensor=True)
+                sim = float(util.cos_sim(q_emb, emb).item())
+                p["score"] = (p["score"] + (sim + 1) / 2) / 2
 
-            # 3) Build LLM prompt (use sanitized question)
-            prompt = f"""
-            You are a helpful medical assistant.
-            Use only the given context to answer.
-            Use subheadings to give your answer and be mindful of tone.
+        pairs.sort(key=lambda x: x["score"], reverse=True)
 
-            CONTEXT:
-            {combined_context}
+        context_docs = "\n\n".join(p["text"] for p in pairs[:10])
 
-            QUESTION:
-            {question_sanitized}
+        # ---------- 3. PROMPT ----------
+        prompt = f"""
+You are a medical assistant.
+Use ONLY the provided context.
+If information is missing, say so.
+Do NOT hallucinate.
+Use subheadings.
 
-            ANSWER:
-            """.strip()
+CONTEXT:
+{context_docs}
 
-            # 4) Generate answer (tracked as generation span)
-            with langfuse.start_as_current_generation(
-                name="groq_generation",
+QUESTION:
+{question_sanitized}
+
+ANSWER:
+""".strip()
+
+        # ---------- 4. LLM GENERATION ----------
+        answer = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
                 model=MODEL,
-                input=prompt,
-            ) if langfuse else contextlib.nullcontext() as gen:
-                answer = await asyncio.to_thread(
-                    lambda: groq_client.chat.completions.create(
-                        model=MODEL,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.0,
-                        max_tokens=450,
-                    ).choices[0].message.content.strip()
-                )
-                if gen:
-                    gen.update(output=answer)
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=450
+            ).choices[0].message.content.strip()
+        )
 
-            print(f"[ANSWER] Generated answer ({len(answer)} chars).")
+        # ---------- 5. SANITIZE ANSWER ----------
+        answer_sanitized = redact_pii(answer)
+        print("DEBUG PII:", detect_pii(answer))
+        print("DEBUG REDACTED:", redact_pii(answer))
+        # ---------- 6. EVALUATION ----------
+        evaluation = await evaluate_response_async(
+            question_sanitized,
+            context_docs,
+            answer_sanitized
+        )
 
-            # 5) Evaluate response
-            evaluation = await evaluate_response_async(question_sanitized, combined_context, answer)
-
-            # ---------- Threshold enforcement (optional) ----------
-            threshold_flags = {k: evaluation.get(k, 0.0) >= v for k, v in EVAL_THRESHOLDS.items()}
-            passed_all = all(threshold_flags.values())
-            if langfuse:
-                try:
-                    langfuse.update_trace(metadata={
-                        "guardrail_status": "pass" if passed_all else "fail",
-                        "thresholds": EVAL_THRESHOLDS,
-                        "scores": {k: evaluation.get(k, 0.0) for k in ["faithfulness","fairness","relevance"]},
-                    })
-                except Exception as e:
-                    print(f"[Langfuse] update_trace (thresholds) failed: {e}")
-
-            if not passed_all:
-                warning_msg = "⚠️ Guardrail triggered: response quality below thresholds."
-                print(warning_msg)
-                return {
-                    "answer": warning_msg,
-                    "evaluation": evaluation
-                }
-
-            # Optional evaluation span
-            if langfuse:
-                try:
-                    with langfuse.start_as_current_span(
-                        name="evaluation",
-                        input={"question": question_sanitized},
-                        output=evaluation,
-                    ):
-                        pass
-                except Exception as e:
-                    print(f"[Langfuse] evaluation span failed: {e}")
-
-            # Ensure Langfuse sends data
-            if langfuse:
-                langfuse.flush()
-
-            print("[EVAL]", json.dumps(evaluation, indent=2))
-            return {"answer": answer, "evaluation": evaluation}
+        return {
+            "answer": answer_sanitized,
+            "evaluation": evaluation
+        }
 
     except Exception as e:
-        print("[FATAL ERROR]", e)
         traceback.print_exc()
         return {"error": str(e)}
 
-# ================== MAIN ENTRY ==================
+# ================== ENTRY ==================
 if __name__ == "__main__":
     app.run(transport="http", host="0.0.0.0", port=8000)
